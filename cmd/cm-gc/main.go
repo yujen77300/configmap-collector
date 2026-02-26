@@ -10,6 +10,8 @@ package main
 import (
 	"context"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -24,15 +26,14 @@ import (
 // cliFlags mirrors config.Config so that Cobra flag values can override the
 // values that Viper loads from the environment.
 type cliFlags struct {
-	namespace   string
-	appLabel    string
-	namePrefix  string
-	keepLast    int
-	keepDays    int
-	dryRun      bool
-	logLevel    string
-	logFormat   string
-	rolloutName string
+	namespace  string
+	appLabel   string
+	namePrefix string
+	keepLast   int
+	keepDays   int
+	dryRun     bool
+	logLevel   string
+	logFormat  string
 }
 
 func main() {
@@ -45,7 +46,11 @@ func main() {
 immutable ConfigMaps with pattern {app}-config-{hash8}.
 
 Dry-run is enabled by default. Set --dry-run=false (or DRY_RUN=false) to perform
-actual deletions.`,
+actual deletions.
+
+Multiple namespaces can be specified as a comma-separated string:
+  --namespace=mwpcloud,staging-ns,prod-ns
+or via the NAMESPACE environment variable.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return run(cmd, flags)
 		},
@@ -53,7 +58,8 @@ actual deletions.`,
 	}
 
 	// Register flags; all have env-var equivalents loaded via Viper in config.Load().
-	rootCmd.Flags().StringVar(&flags.namespace, "namespace", "", "Target namespace (env: NAMESPACE, default: mwpcloud)")
+	// --namespace accepts a comma-separated list: "mwpcloud,staging-ns,prod-ns"
+	rootCmd.Flags().StringVar(&flags.namespace, "namespace", "", "Comma-separated target namespaces (env: NAMESPACE, default: mwpcloud)")
 	rootCmd.Flags().StringVar(&flags.appLabel, "app-label", "", "App label value to match (env: APP_LABEL, default: xzk0-seat)")
 	rootCmd.Flags().StringVar(&flags.namePrefix, "name-prefix", "", "ConfigMap name prefix to filter (env: NAME_PREFIX, default: xzk0-seat-config-)")
 	rootCmd.Flags().IntVar(&flags.keepLast, "keep-last", 0, "Keep N newest ConfigMaps regardless of age (env: KEEP_LAST, default: 5)")
@@ -61,7 +67,6 @@ actual deletions.`,
 	rootCmd.Flags().BoolVar(&flags.dryRun, "dry-run", true, "Log actions without deleting (env: DRY_RUN, default: true)")
 	rootCmd.Flags().StringVar(&flags.logLevel, "log-level", "", "Log level: debug|info|warn|error (env: LOG_LEVEL, default: info)")
 	rootCmd.Flags().StringVar(&flags.logFormat, "log-format", "", "Log format: text|json (env: LOG_FORMAT, default: text)")
-	rootCmd.Flags().StringVar(&flags.rolloutName, "rollout-name", "", "Argo Rollout name (env: ROLLOUT_NAME, default: same as app-label)")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -73,7 +78,6 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 	// 1. Load config from env/defaults, then override with CLI flags.
 	cfg, err := config.Load()
 	if err != nil {
-		// Logger not ready yet — use stderr directly.
 		cmd.PrintErrf("failed to load config: %v\n", err)
 		os.Exit(1)
 	}
@@ -88,16 +92,10 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 	defer logger.Sync() //nolint:errcheck
 
 	// 3. Log startup configuration.
-	rolloutName := cfg.AppLabel // default: rollout name == app label
-	if flags.rolloutName != "" {
-		rolloutName = flags.rolloutName
-	}
-
 	logger.Info("starting cm-gc",
-		zap.String("namespace", cfg.Namespace),
+		zap.Strings("namespaces", cfg.Namespaces),
 		zap.String("app_label", cfg.AppLabel),
 		zap.String("name_prefix", cfg.NamePrefix),
-		zap.String("rollout_name", rolloutName),
 		zap.Int("keep_last", cfg.KeepLast),
 		zap.Int("keep_days", cfg.KeepDays),
 		zap.Bool("dry_run", cfg.DryRun),
@@ -117,13 +115,49 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 	}
 
 	ctx := context.Background()
-
-	// 5. Discover ConfigMaps matching the name prefix.
 	cmClient := k8s.NewKubeConfigMapClient(clients.Kube)
-	allCMs, err := cmClient.ListConfigMaps(ctx, cfg.Namespace, cfg.NamePrefix)
+	rsClient := k8s.NewKubeReplicaSetClient(clients.Kube)
+
+	// 5. Process each namespace concurrently.
+	// anyFailed is set to 1 if any namespace encounters a partial deletion error.
+	var anyFailed atomic.Int32
+	var wg sync.WaitGroup
+
+	for _, ns := range cfg.Namespaces {
+		wg.Add(1)
+		go func(ns string) {
+			defer wg.Done()
+			nsLogger := logger.With(zap.String("namespace", ns))
+			if failed := runForNamespace(ctx, ns, cfg, cmClient, rsClient, nsLogger); failed {
+				anyFailed.Store(1)
+			}
+		}(ns)
+	}
+
+	wg.Wait()
+
+	if anyFailed.Load() != 0 {
+		os.Exit(2)
+	}
+	return nil
+}
+
+// runForNamespace executes the full GC cycle for a single namespace:
+// discover ConfigMaps → resolve in-use → plan → delete (or dry-run log).
+// Returns true if any deletion failed (caller should exit with code 2).
+func runForNamespace(
+	ctx context.Context,
+	ns string,
+	cfg *config.Config,
+	cmClient k8s.ConfigMapClient,
+	rsClient *k8s.KubeReplicaSetClient,
+	logger *zap.Logger,
+) (anyFailed bool) {
+	// 5. Discover ConfigMaps matching the name prefix.
+	allCMs, err := cmClient.ListConfigMaps(ctx, ns, cfg.NamePrefix)
 	if err != nil {
 		logger.Error("failed to list configmaps", zap.Error(err))
-		os.Exit(1)
+		return true
 	}
 	logger.Info("discovered configmaps",
 		zap.Int("total", len(allCMs)),
@@ -132,16 +166,15 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 
 	if len(allCMs) == 0 {
 		logger.Info("no configmaps found matching prefix — nothing to do")
-		return nil
+		return false
 	}
 
-	// 6. Resolve in-use ConfigMaps from ReplicaSets owned by the Rollout.
-	rsClient := k8s.NewKubeReplicaSetClient(clients.Kube)
+	// 6. Resolve in-use ConfigMaps from all Rollout-owned ReplicaSets in the namespace.
 	resolver := k8s.NewInUseResolver(rsClient, cfg.NamePrefix)
-	inUse, err := resolver.Resolve(ctx, cfg.Namespace, rolloutName)
+	inUse, err := resolver.Resolve(ctx, ns)
 	if err != nil {
 		logger.Error("failed to resolve in-use configmaps", zap.Error(err))
-		os.Exit(1)
+		return true
 	}
 	logger.Info("resolved in-use configmaps",
 		zap.Int("count", len(inUse)),
@@ -166,7 +199,7 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 
 	if len(toDelete) == 0 {
 		logger.Info("no configmaps eligible for deletion — done")
-		return nil
+		return false
 	}
 
 	// 9. Log all candidates before acting.
@@ -199,18 +232,17 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 		logger.Info("[DRY-RUN] completed — no deletions performed",
 			zap.Int("would_delete", len(toDelete)),
 		)
-		return nil
+		return false
 	}
 
-	exitCode := 0
 	deleted := 0
 	for _, name := range toDelete {
-		if err := cmClient.DeleteConfigMap(ctx, cfg.Namespace, name); err != nil {
+		if err := cmClient.DeleteConfigMap(ctx, ns, name); err != nil {
 			logger.Error("failed to delete configmap",
 				zap.String("configmap", name),
 				zap.Error(err),
 			)
-			exitCode = 2
+			anyFailed = true
 			continue
 		}
 		logger.Info("deleted configmap", zap.String("configmap", name))
@@ -221,18 +253,15 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 		zap.Int("deleted", deleted),
 		zap.Int("failed", len(toDelete)-deleted),
 	)
-
-	if exitCode != 0 {
-		os.Exit(exitCode)
-	}
-	return nil
+	return anyFailed
 }
 
 // applyFlagOverrides replaces cfg values with any CLI flags that were explicitly
 // set (non-zero / non-empty), so that flags always win over env vars / defaults.
 func applyFlagOverrides(cmd *cobra.Command, flags *cliFlags, cfg *config.Config) {
 	if cmd.Flags().Changed("namespace") {
-		cfg.Namespace = flags.namespace
+		// Re-parse the comma-separated string through the same logic as config.Load().
+		cfg.Namespaces = config.ParseNamespaces(flags.namespace, cfg.Namespaces[0])
 	}
 	if cmd.Flags().Changed("app-label") {
 		cfg.AppLabel = flags.appLabel

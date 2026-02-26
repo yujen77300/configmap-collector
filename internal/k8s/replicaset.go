@@ -22,7 +22,14 @@ const (
 
 // ReplicaSetLister lists ReplicaSets owned by a named Argo Rollout.
 type ReplicaSetLister interface {
+	// ListRolloutReplicaSets returns RS owned by a specific Rollout name.
+	// Retained for backward compatibility and targeted single-rollout use.
 	ListRolloutReplicaSets(ctx context.Context, namespace, rolloutName string) ([]appsv1.ReplicaSet, error)
+
+	// ListNamespaceRolloutReplicaSets returns all RS in the namespace that are
+	// owned by any Argo Rollout (kind=Rollout), regardless of rollout name.
+	// Used for multi-namespace GC where rollout names are not pre-configured.
+	ListNamespaceRolloutReplicaSets(ctx context.Context, namespace string) ([]appsv1.ReplicaSet, error)
 }
 
 // KubeReplicaSetClient is the production implementation backed by a real
@@ -56,11 +63,41 @@ func (k *KubeReplicaSetClient) ListRolloutReplicaSets(ctx context.Context, names
 	return owned, nil
 }
 
+// ListNamespaceRolloutReplicaSets returns all ReplicaSets in the namespace
+// whose ownerReferences contain any entry with kind=Rollout.
+// This is the preferred method for multi-namespace GC: no rollout name is
+// required, and all Rollout-managed RS are included in one API call.
+func (k *KubeReplicaSetClient) ListNamespaceRolloutReplicaSets(ctx context.Context, namespace string) ([]appsv1.ReplicaSet, error) {
+	list, err := k.client.AppsV1().ReplicaSets(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list replicasets in namespace %q: %w", namespace, err)
+	}
+
+	var owned []appsv1.ReplicaSet
+	for _, rs := range list.Items {
+		if isOwnedByAnyRollout(rs) {
+			owned = append(owned, rs)
+		}
+	}
+	return owned, nil
+}
+
 // isOwnedByRollout returns true when any ownerReference on the ReplicaSet
 // has kind="Rollout" and name=rolloutName.
 func isOwnedByRollout(rs appsv1.ReplicaSet, rolloutName string) bool {
 	for _, ref := range rs.OwnerReferences {
 		if ref.Kind == "Rollout" && ref.Name == rolloutName {
+			return true
+		}
+	}
+	return false
+}
+
+// isOwnedByAnyRollout returns true when any ownerReference on the ReplicaSet
+// has kind="Rollout", regardless of the rollout name.
+func isOwnedByAnyRollout(rs appsv1.ReplicaSet) bool {
+	for _, ref := range rs.OwnerReferences {
+		if ref.Kind == "Rollout" {
 			return true
 		}
 	}

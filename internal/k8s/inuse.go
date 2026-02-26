@@ -1,11 +1,11 @@
 package k8s
 
 // InUseResolver builds the set of ConfigMap names that are actively referenced
-// by ReplicaSets owned by a given Argo Rollout.
+// by ReplicaSets owned by any Argo Rollout in the given namespace.
 //
 // Algorithm:
-//  1. List all ReplicaSets in the namespace whose ownerReferences point to the
-//     named Rollout (active RS + history revisions up to revisionHistoryLimit).
+//  1. List all ReplicaSets in the namespace whose ownerReferences point to any
+//     Rollout (active RS + history revisions up to revisionHistoryLimit).
 //  2. For each RS, extract the checksum/config annotation from the pod template.
 //  3. Reconstruct the ConfigMap name as "{namePrefix}{checksum}".
 //  4. Return a deduplicated set of in-use ConfigMap names.
@@ -34,11 +34,13 @@ func NewInUseResolver(rsClient ReplicaSetLister, namePrefix string) *InUseResolv
 }
 
 // Resolve returns a set (map[string]bool) of ConfigMap names that are currently
-// referenced by at least one ReplicaSet owned by rolloutName.
-func (r *InUseResolver) Resolve(ctx context.Context, namespace, rolloutName string) (map[string]bool, error) {
-	rsList, err := r.rsClient.ListRolloutReplicaSets(ctx, namespace, rolloutName)
+// referenced by at least one ReplicaSet owned by any Argo Rollout in the namespace.
+// rolloutName is no longer required — all Rollout-owned RS in the namespace are
+// scanned, which supports multi-namespace GC without pre-configured rollout names.
+func (r *InUseResolver) Resolve(ctx context.Context, namespace string) (map[string]bool, error) {
+	rsList, err := r.rsClient.ListNamespaceRolloutReplicaSets(ctx, namespace)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list replicasets for rollout %q: %w", rolloutName, err)
+		return nil, fmt.Errorf("failed to list replicasets in namespace %q: %w", namespace, err)
 	}
 
 	inUse := make(map[string]bool)

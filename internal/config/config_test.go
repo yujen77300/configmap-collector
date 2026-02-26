@@ -24,7 +24,7 @@ func TestLoad(t *testing.T) {
 			name:    "all defaults when no env vars set",
 			envVars: map[string]string{},
 			expected: Config{
-				Namespace:  "mwpcloud",
+				Namespaces: []string{"mwpcloud"},
 				AppLabel:   "xzk0-seat",
 				NamePrefix: "xzk0-seat-config-",
 				KeepLast:   5,
@@ -47,7 +47,7 @@ func TestLoad(t *testing.T) {
 				"LOG_FORMAT":  "json",
 			},
 			expected: Config{
-				Namespace:  "production",
+				Namespaces: []string{"production"},
 				AppLabel:   "my-app",
 				NamePrefix: "my-app-config-",
 				KeepLast:   3,
@@ -63,7 +63,7 @@ func TestLoad(t *testing.T) {
 				"NAMESPACE": "staging",
 			},
 			expected: Config{
-				Namespace:  "staging",
+				Namespaces: []string{"staging"},
 				AppLabel:   "xzk0-seat",
 				NamePrefix: "xzk0-seat-config-",
 				KeepLast:   5,
@@ -79,7 +79,39 @@ func TestLoad(t *testing.T) {
 				"DRY_RUN": "true",
 			},
 			expected: Config{
-				Namespace:  "mwpcloud",
+				Namespaces: []string{"mwpcloud"},
+				AppLabel:   "xzk0-seat",
+				NamePrefix: "xzk0-seat-config-",
+				KeepLast:   5,
+				KeepDays:   7,
+				DryRun:     true,
+				LogLevel:   "info",
+				LogFormat:  "text",
+			},
+		},
+		{
+			name: "multiple namespaces comma-separated",
+			envVars: map[string]string{
+				"NAMESPACE": "mwpcloud,staging-ns,prod-ns",
+			},
+			expected: Config{
+				Namespaces: []string{"mwpcloud", "staging-ns", "prod-ns"},
+				AppLabel:   "xzk0-seat",
+				NamePrefix: "xzk0-seat-config-",
+				KeepLast:   5,
+				KeepDays:   7,
+				DryRun:     true,
+				LogLevel:   "info",
+				LogFormat:  "text",
+			},
+		},
+		{
+			name: "namespaces with extra spaces are trimmed",
+			envVars: map[string]string{
+				"NAMESPACE": " mwpcloud , staging-ns ",
+			},
+			expected: Config{
+				Namespaces: []string{"mwpcloud", "staging-ns"},
 				AppLabel:   "xzk0-seat",
 				NamePrefix: "xzk0-seat-config-",
 				KeepLast:   5,
@@ -106,6 +138,53 @@ func TestLoad(t *testing.T) {
 
 			assert.NoError(t, err)
 			assert.Equal(t, tt.expected, *cfg)
+		})
+	}
+}
+
+func TestParseNamespaces(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		defaultNS string
+		expected  []string
+	}{
+		{
+			name:      "empty string returns default",
+			raw:       "",
+			defaultNS: "mwpcloud",
+			expected:  []string{"mwpcloud"},
+		},
+		{
+			name:      "single namespace",
+			raw:       "staging",
+			defaultNS: "mwpcloud",
+			expected:  []string{"staging"},
+		},
+		{
+			name:      "multiple namespaces",
+			raw:       "ns-a,ns-b,ns-c",
+			defaultNS: "mwpcloud",
+			expected:  []string{"ns-a", "ns-b", "ns-c"},
+		},
+		{
+			name:      "spaces around entries are trimmed",
+			raw:       " ns-a , ns-b ",
+			defaultNS: "mwpcloud",
+			expected:  []string{"ns-a", "ns-b"},
+		},
+		{
+			name:      "only whitespace returns default",
+			raw:       "   ",
+			defaultNS: "mwpcloud",
+			expected:  []string{"mwpcloud"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseNamespaces(tt.raw, tt.defaultNS)
+			assert.Equal(t, tt.expected, got)
 		})
 	}
 }

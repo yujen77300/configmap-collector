@@ -231,6 +231,63 @@ func TestListRolloutReplicaSets(t *testing.T) {
 	}
 }
 
+// ─── ListNamespaceRolloutReplicaSets ─────────────────────────────────────────
+
+func TestListNamespaceRolloutReplicaSets(t *testing.T) {
+	tests := []struct {
+		name          string
+		existingRS    []appsv1.ReplicaSet
+		expectedNames []string
+	}{
+		{
+			name: "returns RS owned by any Rollout regardless of rollout name",
+			existingRS: []appsv1.ReplicaSet{
+				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
+				makeRS(testNamespace, "other-app-abc123", "other-rollout", "other-uid", "aabbccdd"),
+			},
+			expectedNames: []string{"xzk0-seat-65df947c4c", "other-app-abc123"},
+		},
+		{
+			name: "RS without ownerReferences (no Rollout owner) are excluded",
+			existingRS: []appsv1.ReplicaSet{
+				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
+				makeRSNoOwner(testNamespace, "standalone-rs", "e6120fae"),
+			},
+			expectedNames: []string{"xzk0-seat-65df947c4c"},
+		},
+		{
+			name:          "empty namespace returns empty slice",
+			existingRS:    []appsv1.ReplicaSet{},
+			expectedNames: nil,
+		},
+		{
+			name: "multiple rollouts in namespace — all their RS included",
+			existingRS: []appsv1.ReplicaSet{
+				makeRS(testNamespace, "svc-a-rs1", "svc-a", "uid-a", "aaaaaaaa"),
+				makeRS(testNamespace, "svc-a-rs2", "svc-a", "uid-a", "bbbbbbbb"),
+				makeRS(testNamespace, "svc-b-rs1", "svc-b", "uid-b", "cccccccc"),
+			},
+			expectedNames: []string{"svc-a-rs1", "svc-a-rs2", "svc-b-rs1"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := fake.NewSimpleClientset(rsToRuntimeObjects(tc.existingRS)...)
+			rsClient := NewKubeReplicaSetClient(fakeClient)
+
+			got, err := rsClient.ListNamespaceRolloutReplicaSets(context.Background(), testNamespace)
+			require.NoError(t, err)
+
+			gotNames := make([]string, len(got))
+			for i, rs := range got {
+				gotNames[i] = rs.Name
+			}
+			assert.ElementsMatch(t, tc.expectedNames, gotNames)
+		})
+	}
+}
+
 // ─── GetRevisionHistoryLimit ──────────────────────────────────────────────────
 
 func TestGetRevisionHistoryLimit(t *testing.T) {
@@ -284,11 +341,10 @@ func TestGetRevisionHistoryLimit(t *testing.T) {
 
 func TestInUseResolver_Resolve(t *testing.T) {
 	tests := []struct {
-		name        string
-		existingRS  []appsv1.ReplicaSet
-		rolloutName string
-		namePrefix  string
-		wantInUse   map[string]bool
+		name       string
+		existingRS []appsv1.ReplicaSet
+		namePrefix string
+		wantInUse  map[string]bool
 	}{
 		{
 			name: "statusnow.md: 4 RS → 4 distinct ConfigMaps in-use, da8762a8 is orphan",
@@ -298,8 +354,7 @@ func TestInUseResolver_Resolve(t *testing.T) {
 				makeRS(testNamespace, "xzk0-seat-6977fddb67", testRolloutName, testRolloutUID, "f3bca2cb"), // rev:24
 				makeRS(testNamespace, "xzk0-seat-68b7bd46c8", testRolloutName, testRolloutUID, "d5eb6ebf"), // rev:22
 			},
-			rolloutName: testRolloutName,
-			namePrefix:  testPrefix,
+			namePrefix: testPrefix,
 			wantInUse: map[string]bool{
 				"xzk0-seat-config-e6120fae": true,
 				"xzk0-seat-config-b870a608": true,
@@ -314,30 +369,30 @@ func TestInUseResolver_Resolve(t *testing.T) {
 				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
 				makeRS(testNamespace, "xzk0-seat-847848bbcf", testRolloutName, testRolloutUID, ""), // no annotation
 			},
-			rolloutName: testRolloutName,
-			namePrefix:  testPrefix,
+			namePrefix: testPrefix,
 			wantInUse: map[string]bool{
 				"xzk0-seat-config-e6120fae": true,
 				// xzk0-seat-847848bbcf is skipped, no ConfigMap added
 			},
 		},
 		{
-			name:        "empty namespace: returns empty in-use set",
-			existingRS:  []appsv1.ReplicaSet{},
-			rolloutName: testRolloutName,
-			namePrefix:  testPrefix,
-			wantInUse:   map[string]bool{},
+			name:       "empty namespace: returns empty in-use set",
+			existingRS: []appsv1.ReplicaSet{},
+			namePrefix: testPrefix,
+			wantInUse:  map[string]bool{},
 		},
 		{
-			name: "RS owned by different rollout is excluded",
+			name: "RS owned by different rollout is also included (namespace-wide scan)",
 			existingRS: []appsv1.ReplicaSet{
 				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
 				makeRS(testNamespace, "other-app-abc123", "other-rollout", "other-uid", "deadbeef"),
 			},
-			rolloutName: testRolloutName,
-			namePrefix:  testPrefix,
+			namePrefix: testPrefix,
+			// other-rollout's RS checksum won't match the prefix xzk0-seat-config-,
+			// but it is still scanned. Only e6120fae resolves to a valid CM name.
 			wantInUse: map[string]bool{
 				"xzk0-seat-config-e6120fae": true,
+				"xzk0-seat-config-deadbeef": true,
 			},
 		},
 		{
@@ -346,10 +401,40 @@ func TestInUseResolver_Resolve(t *testing.T) {
 				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
 				makeRS(testNamespace, "xzk0-seat-aabbccdd00", testRolloutName, testRolloutUID, "e6120fae"), // same checksum
 			},
-			rolloutName: testRolloutName,
-			namePrefix:  testPrefix,
+			namePrefix: testPrefix,
 			wantInUse: map[string]bool{
 				"xzk0-seat-config-e6120fae": true,
+			},
+		},
+		{
+			name: "multiple Rollouts in namespace — all RS checksums included in inUse",
+			existingRS: []appsv1.ReplicaSet{
+				// Rollout A: xzk0-seat
+				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
+				makeRS(testNamespace, "xzk0-seat-847848bbcf", testRolloutName, testRolloutUID, "b870a608"),
+				// Rollout B: other-app (different service, same namespace)
+				makeRS(testNamespace, "other-app-rs1", "other-app", "other-uid", "aaaabbbb"),
+			},
+			namePrefix: testPrefix,
+			wantInUse: map[string]bool{
+				// all three RS checksums are included regardless of rollout name
+				"xzk0-seat-config-e6120fae": true,
+				"xzk0-seat-config-b870a608": true,
+				"xzk0-seat-config-aaaabbbb": true,
+			},
+		},
+		{
+			name: "RS owned by Deployment (not Rollout) is excluded from inUse",
+			existingRS: []appsv1.ReplicaSet{
+				// Owned by Rollout — should be included
+				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
+				// Owned by Deployment — should be excluded
+				makeRSNoOwner(testNamespace, "deploy-managed-rs", "cafecafe"),
+			},
+			namePrefix: testPrefix,
+			wantInUse: map[string]bool{
+				"xzk0-seat-config-e6120fae": true,
+				// cafecafe is NOT included — its RS has no Rollout ownerRef
 			},
 		},
 	}
@@ -360,7 +445,7 @@ func TestInUseResolver_Resolve(t *testing.T) {
 			rsClient := NewKubeReplicaSetClient(fakeClient)
 			resolver := NewInUseResolver(rsClient, tc.namePrefix)
 
-			got, err := resolver.Resolve(context.Background(), testNamespace, tc.rolloutName)
+			got, err := resolver.Resolve(context.Background(), testNamespace)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantInUse, got)
 		})
@@ -383,7 +468,7 @@ func TestInUseResolver_OrphanScenario(t *testing.T) {
 	rsClient := NewKubeReplicaSetClient(fakeClient)
 	resolver := NewInUseResolver(rsClient, testPrefix)
 
-	inUse, err := resolver.Resolve(context.Background(), testNamespace, testRolloutName)
+	inUse, err := resolver.Resolve(context.Background(), testNamespace)
 	require.NoError(t, err)
 
 	// da8762a8 is the orphaned ConfigMap — must NOT be in the in-use set.

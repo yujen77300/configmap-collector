@@ -1,10 +1,17 @@
 package config
 
-import "github.com/spf13/viper"
+import (
+	"strings"
+
+	"github.com/spf13/viper"
+)
 
 // Config holds all configuration parameters for the ConfigMap GC.
 type Config struct {
-	Namespace  string
+	// Namespaces is the list of target namespaces to scan.
+	// Accepts a comma-separated string via the NAMESPACE env var or --namespace flag,
+	// e.g. "mwpcloud,staging-ns,prod-ns".
+	Namespaces []string
 	AppLabel   string
 	NamePrefix string
 	KeepLast   int
@@ -12,6 +19,28 @@ type Config struct {
 	DryRun     bool
 	LogLevel   string
 	LogFormat  string
+}
+
+// ParseNamespaces splits a comma-separated namespace string into a trimmed,
+// non-empty slice. Falls back to defaultNS when the input is blank.
+// Exported so callers such as CLI flag overrides can reuse the same parsing logic.
+func ParseNamespaces(raw, defaultNS string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []string{defaultNS}
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	if len(result) == 0 {
+		return []string{defaultNS}
+	}
+	return result
 }
 
 // Load reads configuration from environment variables with fallback to defaults.
@@ -34,7 +63,7 @@ func Load() (*Config, error) {
 	v.AutomaticEnv()
 
 	return &Config{
-		Namespace:  v.GetString("NAMESPACE"),
+		Namespaces: ParseNamespaces(v.GetString("NAMESPACE"), "mwpcloud"),
 		AppLabel:   v.GetString("APP_LABEL"),
 		NamePrefix: v.GetString("NAME_PREFIX"),
 		KeepLast:   v.GetInt("KEEP_LAST"),
