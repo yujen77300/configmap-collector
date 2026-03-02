@@ -115,6 +115,7 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 	ctx := context.Background()
 	cmClient := k8s.NewKubeConfigMapClient(clients.Kube)
 	rsClient := k8s.NewKubeReplicaSetClient(clients.Kube)
+	rolloutClient := k8s.NewKubeRolloutClient(clients.Rollout)
 
 	// 5. Process each namespace concurrently.
 	// anyFailed is set to 1 if any namespace encounters a partial deletion error.
@@ -126,7 +127,7 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 		go func(ns string) {
 			defer wg.Done()
 			nsLogger := logger.With(zap.String("namespace", ns))
-			if failed := runForNamespace(ctx, ns, cfg, cmClient, rsClient, nsLogger); failed {
+			if failed := runForNamespace(ctx, ns, cfg, cmClient, rsClient, rolloutClient, nsLogger); failed {
 				anyFailed.Store(1)
 			}
 		}(ns)
@@ -141,8 +142,10 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 }
 
 // runForNamespace executes the full GC cycle for a single namespace:
-// discover all ConfigMaps → resolve in-use checksums from Rollout RS →
-// filter candidates by checksum → plan → delete (or dry-run log).
+//  1. List all Rollouts → auto-derive ConfigMap prefix per Rollout
+//  2. For each Rollout: list prefix-matched CMs → resolve in-use checksums →
+//     plan → delete (or dry-run log).
+//
 // Returns true if any deletion failed (caller should exit with code 2).
 func runForNamespace(
 	ctx context.Context,
@@ -150,62 +153,77 @@ func runForNamespace(
 	cfg *config.Config,
 	cmClient k8s.ConfigMapClient,
 	rsClient *k8s.KubeReplicaSetClient,
+	rolloutClient *k8s.KubeRolloutClient,
 	logger *zap.Logger,
 ) (anyFailed bool) {
-	// 5. Discover ALL ConfigMaps in the namespace (no prefix filter).
-	allCMs, err := cmClient.ListAllConfigMaps(ctx, ns)
+	// 5. Discover all Rollout names in the namespace.
+	// Each Rollout "foo" manages ConfigMaps with prefix "foo-config-".
+	rolloutNames, err := rolloutClient.ListRolloutNames(ctx, ns)
 	if err != nil {
-		logger.Error("failed to list configmaps", zap.Error(err))
+		logger.Error("failed to list rollouts", zap.Error(err))
 		return true
 	}
-	logger.Info("discovered configmaps", zap.Int("total", len(allCMs)))
+	logger.Info("discovered rollouts",
+		zap.Strings("rollouts", rolloutNames),
+	)
 
-	if len(allCMs) == 0 {
-		logger.Info("no configmaps found in namespace — nothing to do")
+	if len(rolloutNames) == 0 {
+		logger.Info("no rollouts found in namespace — nothing to do")
 		return false
 	}
 
-	// 6. Resolve in-use checksums from all Rollout-owned ReplicaSets in the namespace.
+	// 6. Resolve in-use checksums once for all Rollout-owned ReplicaSets
+	// in the namespace (a single API call covers all Rollouts).
 	resolver := k8s.NewInUseResolver(rsClient)
 	checksums, err := resolver.Resolve(ctx, ns)
 	if err != nil {
 		logger.Error("failed to resolve in-use checksums", zap.Error(err))
 		return true
 	}
-	logger.Info("resolved in-use checksums",
+	logger.Info("resolved in-use checksums from rollout replicasets",
 		zap.Int("count", len(checksums)),
 		zap.Strings("checksums", mapKeys(checksums)),
 	)
 
-	// 7. Filter to only ConfigMaps whose names contain an in-use checksum.
-	// These are the candidates managed by the Helm checksum pattern; all others
-	// (e.g. plain ConfigMaps not following the pattern) are left untouched.
-	candidateCMs := k8s.FilterConfigMapsByChecksums(allCMs, checksums)
-	logger.Info("configmaps matching checksum pattern",
+	// 7. Process each Rollout independently using its auto-derived prefix.
+	for _, rolloutName := range rolloutNames {
+		prefix := rolloutName + "-config-"
+		rolloutLogger := logger.With(zap.String("rollout", rolloutName), zap.String("prefix", prefix))
+		if failed := runForRollout(ctx, ns, prefix, cfg, cmClient, checksums, rolloutLogger); failed {
+			anyFailed = true
+		}
+	}
+	return anyFailed
+}
+
+// runForRollout runs the GC cycle for a single Rollout within a namespace,
+// using the pre-resolved checksum set shared across all Rollouts.
+func runForRollout(
+	ctx context.Context,
+	ns string,
+	prefix string,
+	cfg *config.Config,
+	cmClient k8s.ConfigMapClient,
+	checksums map[string]bool,
+	logger *zap.Logger,
+) (anyFailed bool) {
+	// List only ConfigMaps matching this Rollout's auto-derived prefix.
+	candidateCMs, err := cmClient.ListConfigMaps(ctx, ns, prefix)
+	if err != nil {
+		logger.Error("failed to list configmaps")
+		return true
+	}
+	logger.Info("discovered configmaps matching prefix",
 		zap.Int("count", len(candidateCMs)),
 	)
 
 	if len(candidateCMs) == 0 {
-		logger.Info("no checksum-pattern configmaps found — nothing to do")
+		logger.Info("no configmaps found matching prefix — nothing to do")
 		return false
 	}
 
-	// 8. Build planner candidates.
-	candidates := make([]planner.ConfigMapCandidate, 0, len(candidateCMs))
-	for _, cm := range candidateCMs {
-		candidates = append(candidates, planner.ConfigMapCandidate{
-			Name:              cm.Name,
-			CreationTimestamp: cm.CreationTimestamp.Time,
-			Annotations:       cm.Annotations,
-		})
-	}
-
-	// 9. Run the deletion planner.
-	// inUse for the planner: any CM whose name contains an active checksum.
-	// FilterConfigMapsByChecksums already narrowed our list to those CMs;
-	// we still need the inUse set (keyed by full CM name) for the planner to
-	// identify which of the candidate CMs are currently referenced.
-	inUse := make(map[string]bool, len(candidateCMs))
+	// Build the inUse set (keyed by full CM name) for this Rollout's candidates.
+	inUse := make(map[string]bool)
 	for _, cm := range candidateCMs {
 		for checksum := range checksums {
 			if strings.Contains(cm.Name, checksum) {
@@ -213,6 +231,19 @@ func runForNamespace(
 				break
 			}
 		}
+	}
+	logger.Debug("in-use configmaps (referenced by replicasets)",
+		zap.Strings("configmaps", mapKeys(inUse)),
+	)
+
+	// Build planner candidates.
+	candidates := make([]planner.ConfigMapCandidate, 0, len(candidateCMs))
+	for _, cm := range candidateCMs {
+		candidates = append(candidates, planner.ConfigMapCandidate{
+			Name:              cm.Name,
+			CreationTimestamp: cm.CreationTimestamp.Time,
+			Annotations:       cm.Annotations,
+		})
 	}
 
 	toDelete := planner.Plan(candidates, inUse, cfg.KeepLast, cfg.KeepDays, time.Now())
@@ -225,7 +256,7 @@ func runForNamespace(
 		return false
 	}
 
-	// 10. Log all candidates before acting.
+	// Log all candidates before acting.
 	now := time.Now()
 	for _, name := range toDelete {
 		var age time.Duration
@@ -250,7 +281,7 @@ func runForNamespace(
 		}
 	}
 
-	// 11. Execute deletions (skipped in dry-run mode).
+	// Execute deletions (skipped in dry-run mode).
 	if cfg.DryRun {
 		logger.Info("[DRY-RUN] completed — no deletions performed",
 			zap.Int("would_delete", len(toDelete)),

@@ -22,6 +22,11 @@ type RolloutGetter interface {
 	GetRevisionHistoryLimit(ctx context.Context, namespace, rolloutName string) (int, error)
 }
 
+// RolloutLister lists all Rollout names in a namespace.
+type RolloutLister interface {
+	ListRolloutNames(ctx context.Context, namespace string) ([]string, error)
+}
+
 // KubeRolloutClient is the production implementation backed by the Argo
 // Rollouts clientset. Pass a fake rollout clientset in unit tests.
 type KubeRolloutClient struct {
@@ -32,6 +37,22 @@ type KubeRolloutClient struct {
 // Argo Rollouts clientset.Interface.
 func NewKubeRolloutClient(client rolloutclientset.Interface) *KubeRolloutClient {
 	return &KubeRolloutClient{client: client}
+}
+
+// ListRolloutNames returns the names of all Argo Rollouts in the given namespace.
+// This is used to auto-derive ConfigMap name prefixes without requiring
+// manual configuration — each Rollout named "foo" manages ConfigMaps with
+// prefix "foo-config-".
+func (k *KubeRolloutClient) ListRolloutNames(ctx context.Context, namespace string) ([]string, error) {
+	list, err := k.client.ArgoprojV1alpha1().Rollouts(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list rollouts in namespace %q: %w", namespace, err)
+	}
+	names := make([]string, 0, len(list.Items))
+	for _, r := range list.Items {
+		names = append(names, r.Name)
+	}
+	return names, nil
 }
 
 // GetRevisionHistoryLimit returns the revisionHistoryLimit from the named
