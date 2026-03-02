@@ -201,6 +201,142 @@ func TestKubeConfigMapClient_ImplementsInterface(t *testing.T) {
 	var _ ConfigMapClient = (*KubeConfigMapClient)(nil)
 }
 
+// ─── ListAllConfigMaps ────────────────────────────────────────────────────────
+
+func TestListAllConfigMaps(t *testing.T) {
+	tests := []struct {
+		name          string
+		existingCMs   []corev1.ConfigMap
+		queryNS       string
+		expectedNames []string
+	}{
+		{
+			name: "returns all CMs regardless of name pattern",
+			existingCMs: []corev1.ConfigMap{
+				makeConfigMap(testNamespace, "xzk0-seat-config-e6120fae", nil),
+				makeConfigMap(testNamespace, "test-app-config-aaa1111", nil),
+				makeConfigMap(testNamespace, "other-svc-cfg-bbb2222", nil),
+			},
+			queryNS: testNamespace,
+			expectedNames: []string{
+				"xzk0-seat-config-e6120fae",
+				"test-app-config-aaa1111",
+				"other-svc-cfg-bbb2222",
+			},
+		},
+		{
+			name:          "returns empty slice when namespace has no CMs",
+			existingCMs:   []corev1.ConfigMap{},
+			queryNS:       testNamespace,
+			expectedNames: nil,
+		},
+		{
+			name: "does not return CMs from a different namespace",
+			existingCMs: []corev1.ConfigMap{
+				makeConfigMap(testNamespace, "xzk0-seat-config-e6120fae", nil),
+				makeConfigMap("other-ns", "xzk0-seat-config-b870a608", nil),
+			},
+			queryNS: testNamespace,
+			expectedNames: []string{
+				"xzk0-seat-config-e6120fae",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeClient := fake.NewSimpleClientset(objectsToRuntimeObjects(tc.existingCMs)...)
+			cmClient := NewKubeConfigMapClient(fakeClient)
+
+			got, err := cmClient.ListAllConfigMaps(context.Background(), tc.queryNS)
+			require.NoError(t, err)
+
+			gotNames := extractNames(got)
+			assert.ElementsMatch(t, tc.expectedNames, gotNames)
+		})
+	}
+}
+
+// ─── FilterConfigMapsByChecksums ─────────────────────────────────────────────
+
+func TestFilterConfigMapsByChecksums(t *testing.T) {
+	tests := []struct {
+		name          string
+		cms           []corev1.ConfigMap
+		checksums     map[string]bool
+		expectedNames []string
+	}{
+		{
+			name: "matches CMs whose names contain a checksum (multi-service namespace)",
+			cms: []corev1.ConfigMap{
+				makeConfigMap(testNamespace, "xzk0-seat-config-e6120fae", nil), // checksum: e6120fae
+				makeConfigMap(testNamespace, "test-app-config-aaa1111", nil),   // checksum: aaa1111
+				makeConfigMap(testNamespace, "other-svc-cfg-bbb2222", nil),     // not in checksum set
+			},
+			checksums: map[string]bool{
+				"e6120fae": true,
+				"aaa1111":  true,
+			},
+			expectedNames: []string{
+				"xzk0-seat-config-e6120fae",
+				"test-app-config-aaa1111",
+			},
+		},
+		{
+			name: "statusnow.md scenario: 5 CMs, 4 checksums in-use, 1 matched by no checksum",
+			cms: []corev1.ConfigMap{
+				makeConfigMap(testNamespace, "xzk0-seat-config-e6120fae", nil),
+				makeConfigMap(testNamespace, "xzk0-seat-config-b870a608", nil),
+				makeConfigMap(testNamespace, "xzk0-seat-config-f3bca2cb", nil),
+				makeConfigMap(testNamespace, "xzk0-seat-config-d5eb6ebf", nil),
+				makeConfigMap(testNamespace, "xzk0-seat-config-da8762a8", nil), // not in checksums
+			},
+			checksums: map[string]bool{
+				"e6120fae": true,
+				"b870a608": true,
+				"f3bca2cb": true,
+				"d5eb6ebf": true,
+			},
+			expectedNames: []string{
+				"xzk0-seat-config-e6120fae",
+				"xzk0-seat-config-b870a608",
+				"xzk0-seat-config-f3bca2cb",
+				"xzk0-seat-config-d5eb6ebf",
+			},
+		},
+		{
+			name: "returns nil when no CMs match any checksum",
+			cms: []corev1.ConfigMap{
+				makeConfigMap(testNamespace, "xzk0-seat-config-da8762a8", nil),
+			},
+			checksums:     map[string]bool{"e6120fae": true},
+			expectedNames: nil,
+		},
+		{
+			name: "returns nil when checksum set is empty",
+			cms: []corev1.ConfigMap{
+				makeConfigMap(testNamespace, "xzk0-seat-config-e6120fae", nil),
+			},
+			checksums:     map[string]bool{},
+			expectedNames: nil,
+		},
+		{
+			name:          "returns nil when cms slice is empty",
+			cms:           []corev1.ConfigMap{},
+			checksums:     map[string]bool{"e6120fae": true},
+			expectedNames: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FilterConfigMapsByChecksums(tc.cms, tc.checksums)
+			gotNames := extractNames(got)
+			assert.ElementsMatch(t, tc.expectedNames, gotNames)
+		})
+	}
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 func extractNames(cms []corev1.ConfigMap) []string {

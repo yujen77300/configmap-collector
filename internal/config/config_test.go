@@ -9,7 +9,7 @@ import (
 // allEnvKeys lists every env key Load() reads.
 // Used to guarantee a clean slate before each table-driven case.
 var allEnvKeys = []string{
-	"NAMESPACE", "APP_LABEL", "NAME_PREFIX",
+	"NAMESPACE", "APP_LABEL",
 	"KEEP_LAST", "KEEP_DAYS", "DRY_RUN",
 	"LOG_LEVEL", "LOG_FORMAT",
 }
@@ -26,7 +26,6 @@ func TestLoad(t *testing.T) {
 			expected: Config{
 				Namespaces: []string{"mwpcloud"},
 				AppLabel:   "xzk0-seat",
-				NamePrefix: "xzk0-seat-config-",
 				KeepLast:   5,
 				KeepDays:   7,
 				DryRun:     true,
@@ -37,19 +36,17 @@ func TestLoad(t *testing.T) {
 		{
 			name: "all fields overridden by env vars",
 			envVars: map[string]string{
-				"NAMESPACE":   "production",
-				"APP_LABEL":   "my-app",
-				"NAME_PREFIX": "my-app-config-",
-				"KEEP_LAST":   "3",
-				"KEEP_DAYS":   "14",
-				"DRY_RUN":     "false",
-				"LOG_LEVEL":   "debug",
-				"LOG_FORMAT":  "json",
+				"NAMESPACE":  "production",
+				"APP_LABEL":  "my-app",
+				"KEEP_LAST":  "3",
+				"KEEP_DAYS":  "14",
+				"DRY_RUN":    "false",
+				"LOG_LEVEL":  "debug",
+				"LOG_FORMAT": "json",
 			},
 			expected: Config{
 				Namespaces: []string{"production"},
 				AppLabel:   "my-app",
-				NamePrefix: "my-app-config-",
 				KeepLast:   3,
 				KeepDays:   14,
 				DryRun:     false,
@@ -65,7 +62,6 @@ func TestLoad(t *testing.T) {
 			expected: Config{
 				Namespaces: []string{"staging"},
 				AppLabel:   "xzk0-seat",
-				NamePrefix: "xzk0-seat-config-",
 				KeepLast:   5,
 				KeepDays:   7,
 				DryRun:     true,
@@ -81,7 +77,6 @@ func TestLoad(t *testing.T) {
 			expected: Config{
 				Namespaces: []string{"mwpcloud"},
 				AppLabel:   "xzk0-seat",
-				NamePrefix: "xzk0-seat-config-",
 				KeepLast:   5,
 				KeepDays:   7,
 				DryRun:     true,
@@ -97,7 +92,6 @@ func TestLoad(t *testing.T) {
 			expected: Config{
 				Namespaces: []string{"mwpcloud", "staging-ns", "prod-ns"},
 				AppLabel:   "xzk0-seat",
-				NamePrefix: "xzk0-seat-config-",
 				KeepLast:   5,
 				KeepDays:   7,
 				DryRun:     true,
@@ -113,7 +107,6 @@ func TestLoad(t *testing.T) {
 			expected: Config{
 				Namespaces: []string{"mwpcloud", "staging-ns"},
 				AppLabel:   "xzk0-seat",
-				NamePrefix: "xzk0-seat-config-",
 				KeepLast:   5,
 				KeepDays:   7,
 				DryRun:     true,

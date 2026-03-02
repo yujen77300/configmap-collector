@@ -13,7 +13,6 @@ type Config struct {
 	// e.g. "mwpcloud,staging-ns,prod-ns".
 	Namespaces []string
 	AppLabel   string
-	NamePrefix string
 	KeepLast   int
 	KeepDays   int
 	DryRun     bool
@@ -53,7 +52,6 @@ func Load() (*Config, error) {
 	// Set defaults
 	v.SetDefault("NAMESPACE", "mwpcloud")
 	v.SetDefault("APP_LABEL", "xzk0-seat")
-	v.SetDefault("NAME_PREFIX", "xzk0-seat-config-")
 	v.SetDefault("KEEP_LAST", 5)
 	v.SetDefault("KEEP_DAYS", 7)
 	v.SetDefault("DRY_RUN", true)
@@ -65,7 +63,6 @@ func Load() (*Config, error) {
 	return &Config{
 		Namespaces: ParseNamespaces(v.GetString("NAMESPACE"), "mwpcloud"),
 		AppLabel:   v.GetString("APP_LABEL"),
-		NamePrefix: v.GetString("NAME_PREFIX"),
 		KeepLast:   v.GetInt("KEEP_LAST"),
 		KeepDays:   v.GetInt("KEEP_DAYS"),
 		DryRun:     v.GetBool("DRY_RUN"),

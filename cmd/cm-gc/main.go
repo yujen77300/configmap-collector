@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,14 +27,13 @@ import (
 // cliFlags mirrors config.Config so that Cobra flag values can override the
 // values that Viper loads from the environment.
 type cliFlags struct {
-	namespace  string
-	appLabel   string
-	namePrefix string
-	keepLast   int
-	keepDays   int
-	dryRun     bool
-	logLevel   string
-	logFormat  string
+	namespace string
+	appLabel  string
+	keepLast  int
+	keepDays  int
+	dryRun    bool
+	logLevel  string
+	logFormat string
 }
 
 func main() {
@@ -61,7 +61,6 @@ or via the NAMESPACE environment variable.`,
 	// --namespace accepts a comma-separated list: "mwpcloud,staging-ns,prod-ns"
 	rootCmd.Flags().StringVar(&flags.namespace, "namespace", "", "Comma-separated target namespaces (env: NAMESPACE, default: mwpcloud)")
 	rootCmd.Flags().StringVar(&flags.appLabel, "app-label", "", "App label value to match (env: APP_LABEL, default: xzk0-seat)")
-	rootCmd.Flags().StringVar(&flags.namePrefix, "name-prefix", "", "ConfigMap name prefix to filter (env: NAME_PREFIX, default: xzk0-seat-config-)")
 	rootCmd.Flags().IntVar(&flags.keepLast, "keep-last", 0, "Keep N newest ConfigMaps regardless of age (env: KEEP_LAST, default: 5)")
 	rootCmd.Flags().IntVar(&flags.keepDays, "keep-days", 0, "Keep ConfigMaps newer than N days (env: KEEP_DAYS, default: 7)")
 	rootCmd.Flags().BoolVar(&flags.dryRun, "dry-run", true, "Log actions without deleting (env: DRY_RUN, default: true)")
@@ -95,7 +94,6 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 	logger.Info("starting cm-gc",
 		zap.Strings("namespaces", cfg.Namespaces),
 		zap.String("app_label", cfg.AppLabel),
-		zap.String("name_prefix", cfg.NamePrefix),
 		zap.Int("keep_last", cfg.KeepLast),
 		zap.Int("keep_days", cfg.KeepDays),
 		zap.Bool("dry_run", cfg.DryRun),
@@ -143,7 +141,8 @@ func run(cmd *cobra.Command, flags *cliFlags) error {
 }
 
 // runForNamespace executes the full GC cycle for a single namespace:
-// discover ConfigMaps → resolve in-use → plan → delete (or dry-run log).
+// discover all ConfigMaps → resolve in-use checksums from Rollout RS →
+// filter candidates by checksum → plan → delete (or dry-run log).
 // Returns true if any deletion failed (caller should exit with code 2).
 func runForNamespace(
 	ctx context.Context,
@@ -153,37 +152,47 @@ func runForNamespace(
 	rsClient *k8s.KubeReplicaSetClient,
 	logger *zap.Logger,
 ) (anyFailed bool) {
-	// 5. Discover ConfigMaps matching the name prefix.
-	allCMs, err := cmClient.ListConfigMaps(ctx, ns, cfg.NamePrefix)
+	// 5. Discover ALL ConfigMaps in the namespace (no prefix filter).
+	allCMs, err := cmClient.ListAllConfigMaps(ctx, ns)
 	if err != nil {
 		logger.Error("failed to list configmaps", zap.Error(err))
 		return true
 	}
-	logger.Info("discovered configmaps",
-		zap.Int("total", len(allCMs)),
-		zap.String("prefix", cfg.NamePrefix),
-	)
+	logger.Info("discovered configmaps", zap.Int("total", len(allCMs)))
 
 	if len(allCMs) == 0 {
-		logger.Info("no configmaps found matching prefix — nothing to do")
+		logger.Info("no configmaps found in namespace — nothing to do")
 		return false
 	}
 
-	// 6. Resolve in-use ConfigMaps from all Rollout-owned ReplicaSets in the namespace.
-	resolver := k8s.NewInUseResolver(rsClient, cfg.NamePrefix)
-	inUse, err := resolver.Resolve(ctx, ns)
+	// 6. Resolve in-use checksums from all Rollout-owned ReplicaSets in the namespace.
+	resolver := k8s.NewInUseResolver(rsClient)
+	checksums, err := resolver.Resolve(ctx, ns)
 	if err != nil {
-		logger.Error("failed to resolve in-use configmaps", zap.Error(err))
+		logger.Error("failed to resolve in-use checksums", zap.Error(err))
 		return true
 	}
-	logger.Info("resolved in-use configmaps",
-		zap.Int("count", len(inUse)),
-		zap.Strings("names", mapKeys(inUse)),
+	logger.Info("resolved in-use checksums",
+		zap.Int("count", len(checksums)),
+		zap.Strings("checksums", mapKeys(checksums)),
 	)
 
-	// 7. Build planner candidates from the discovered ConfigMaps.
-	candidates := make([]planner.ConfigMapCandidate, 0, len(allCMs))
-	for _, cm := range allCMs {
+	// 7. Filter to only ConfigMaps whose names contain an in-use checksum.
+	// These are the candidates managed by the Helm checksum pattern; all others
+	// (e.g. plain ConfigMaps not following the pattern) are left untouched.
+	candidateCMs := k8s.FilterConfigMapsByChecksums(allCMs, checksums)
+	logger.Info("configmaps matching checksum pattern",
+		zap.Int("count", len(candidateCMs)),
+	)
+
+	if len(candidateCMs) == 0 {
+		logger.Info("no checksum-pattern configmaps found — nothing to do")
+		return false
+	}
+
+	// 8. Build planner candidates.
+	candidates := make([]planner.ConfigMapCandidate, 0, len(candidateCMs))
+	for _, cm := range candidateCMs {
 		candidates = append(candidates, planner.ConfigMapCandidate{
 			Name:              cm.Name,
 			CreationTimestamp: cm.CreationTimestamp.Time,
@@ -191,7 +200,21 @@ func runForNamespace(
 		})
 	}
 
-	// 8. Run the deletion planner.
+	// 9. Run the deletion planner.
+	// inUse for the planner: any CM whose name contains an active checksum.
+	// FilterConfigMapsByChecksums already narrowed our list to those CMs;
+	// we still need the inUse set (keyed by full CM name) for the planner to
+	// identify which of the candidate CMs are currently referenced.
+	inUse := make(map[string]bool, len(candidateCMs))
+	for _, cm := range candidateCMs {
+		for checksum := range checksums {
+			if strings.Contains(cm.Name, checksum) {
+				inUse[cm.Name] = true
+				break
+			}
+		}
+	}
+
 	toDelete := planner.Plan(candidates, inUse, cfg.KeepLast, cfg.KeepDays, time.Now())
 	logger.Info("planner result",
 		zap.Int("candidates_for_deletion", len(toDelete)),
@@ -202,11 +225,11 @@ func runForNamespace(
 		return false
 	}
 
-	// 9. Log all candidates before acting.
+	// 10. Log all candidates before acting.
 	now := time.Now()
 	for _, name := range toDelete {
 		var age time.Duration
-		for _, cm := range allCMs {
+		for _, cm := range candidateCMs {
 			if cm.Name == name {
 				age = now.Sub(cm.CreationTimestamp.Time)
 				break
@@ -227,7 +250,7 @@ func runForNamespace(
 		}
 	}
 
-	// 10. Execute deletions (skipped in dry-run mode).
+	// 11. Execute deletions (skipped in dry-run mode).
 	if cfg.DryRun {
 		logger.Info("[DRY-RUN] completed — no deletions performed",
 			zap.Int("would_delete", len(toDelete)),
@@ -265,9 +288,6 @@ func applyFlagOverrides(cmd *cobra.Command, flags *cliFlags, cfg *config.Config)
 	}
 	if cmd.Flags().Changed("app-label") {
 		cfg.AppLabel = flags.appLabel
-	}
-	if cmd.Flags().Changed("name-prefix") {
-		cfg.NamePrefix = flags.namePrefix
 	}
 	if cmd.Flags().Changed("keep-last") {
 		cfg.KeepLast = flags.keepLast

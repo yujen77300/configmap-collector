@@ -343,23 +343,21 @@ func TestInUseResolver_Resolve(t *testing.T) {
 	tests := []struct {
 		name       string
 		existingRS []appsv1.ReplicaSet
-		namePrefix string
 		wantInUse  map[string]bool
 	}{
 		{
-			name: "statusnow.md: 4 RS → 4 distinct ConfigMaps in-use, da8762a8 is orphan",
+			name: "statusnow.md: 4 RS → 4 distinct checksums in-use, da8762a8 is orphan",
 			existingRS: []appsv1.ReplicaSet{
 				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"), // rev:26 active
 				makeRS(testNamespace, "xzk0-seat-847848bbcf", testRolloutName, testRolloutUID, "b870a608"), // rev:25
 				makeRS(testNamespace, "xzk0-seat-6977fddb67", testRolloutName, testRolloutUID, "f3bca2cb"), // rev:24
 				makeRS(testNamespace, "xzk0-seat-68b7bd46c8", testRolloutName, testRolloutUID, "d5eb6ebf"), // rev:22
 			},
-			namePrefix: testPrefix,
 			wantInUse: map[string]bool{
-				"xzk0-seat-config-e6120fae": true,
-				"xzk0-seat-config-b870a608": true,
-				"xzk0-seat-config-f3bca2cb": true,
-				"xzk0-seat-config-d5eb6ebf": true,
+				"e6120fae": true,
+				"b870a608": true,
+				"f3bca2cb": true,
+				"d5eb6ebf": true,
 				// da8762a8 is NOT listed → orphan → eligible for deletion
 			},
 		},
@@ -369,16 +367,14 @@ func TestInUseResolver_Resolve(t *testing.T) {
 				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
 				makeRS(testNamespace, "xzk0-seat-847848bbcf", testRolloutName, testRolloutUID, ""), // no annotation
 			},
-			namePrefix: testPrefix,
 			wantInUse: map[string]bool{
-				"xzk0-seat-config-e6120fae": true,
-				// xzk0-seat-847848bbcf is skipped, no ConfigMap added
+				"e6120fae": true,
+				// xzk0-seat-847848bbcf is skipped, no checksum added
 			},
 		},
 		{
 			name:       "empty namespace: returns empty in-use set",
 			existingRS: []appsv1.ReplicaSet{},
-			namePrefix: testPrefix,
 			wantInUse:  map[string]bool{},
 		},
 		{
@@ -387,12 +383,9 @@ func TestInUseResolver_Resolve(t *testing.T) {
 				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
 				makeRS(testNamespace, "other-app-abc123", "other-rollout", "other-uid", "deadbeef"),
 			},
-			namePrefix: testPrefix,
-			// other-rollout's RS checksum won't match the prefix xzk0-seat-config-,
-			// but it is still scanned. Only e6120fae resolves to a valid CM name.
 			wantInUse: map[string]bool{
-				"xzk0-seat-config-e6120fae": true,
-				"xzk0-seat-config-deadbeef": true,
+				"e6120fae": true,
+				"deadbeef": true,
 			},
 		},
 		{
@@ -401,9 +394,8 @@ func TestInUseResolver_Resolve(t *testing.T) {
 				makeRS(testNamespace, "xzk0-seat-65df947c4c", testRolloutName, testRolloutUID, "e6120fae"),
 				makeRS(testNamespace, "xzk0-seat-aabbccdd00", testRolloutName, testRolloutUID, "e6120fae"), // same checksum
 			},
-			namePrefix: testPrefix,
 			wantInUse: map[string]bool{
-				"xzk0-seat-config-e6120fae": true,
+				"e6120fae": true,
 			},
 		},
 		{
@@ -415,12 +407,11 @@ func TestInUseResolver_Resolve(t *testing.T) {
 				// Rollout B: other-app (different service, same namespace)
 				makeRS(testNamespace, "other-app-rs1", "other-app", "other-uid", "aaaabbbb"),
 			},
-			namePrefix: testPrefix,
 			wantInUse: map[string]bool{
 				// all three RS checksums are included regardless of rollout name
-				"xzk0-seat-config-e6120fae": true,
-				"xzk0-seat-config-b870a608": true,
-				"xzk0-seat-config-aaaabbbb": true,
+				"e6120fae": true,
+				"b870a608": true,
+				"aaaabbbb": true,
 			},
 		},
 		{
@@ -431,9 +422,8 @@ func TestInUseResolver_Resolve(t *testing.T) {
 				// Owned by Deployment — should be excluded
 				makeRSNoOwner(testNamespace, "deploy-managed-rs", "cafecafe"),
 			},
-			namePrefix: testPrefix,
 			wantInUse: map[string]bool{
-				"xzk0-seat-config-e6120fae": true,
+				"e6120fae": true,
 				// cafecafe is NOT included — its RS has no Rollout ownerRef
 			},
 		},
@@ -443,7 +433,7 @@ func TestInUseResolver_Resolve(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeClient := fake.NewSimpleClientset(rsToRuntimeObjects(tc.existingRS)...)
 			rsClient := NewKubeReplicaSetClient(fakeClient)
-			resolver := NewInUseResolver(rsClient, tc.namePrefix)
+			resolver := NewInUseResolver(rsClient)
 
 			got, err := resolver.Resolve(context.Background(), testNamespace)
 			require.NoError(t, err)
@@ -466,21 +456,21 @@ func TestInUseResolver_OrphanScenario(t *testing.T) {
 
 	fakeClient := fake.NewSimpleClientset(rsToRuntimeObjects(rsList)...)
 	rsClient := NewKubeReplicaSetClient(fakeClient)
-	resolver := NewInUseResolver(rsClient, testPrefix)
+	resolver := NewInUseResolver(rsClient)
 
-	inUse, err := resolver.Resolve(context.Background(), testNamespace)
+	checksums, err := resolver.Resolve(context.Background(), testNamespace)
 	require.NoError(t, err)
 
-	// da8762a8 is the orphaned ConfigMap — must NOT be in the in-use set.
-	assert.False(t, inUse["xzk0-seat-config-da8762a8"],
+	// da8762a8 is the orphaned ConfigMap — its checksum must NOT be in the set.
+	assert.False(t, checksums["da8762a8"],
 		"da8762a8 should not be in-use (orphaned ConfigMap)")
 
-	// All 4 referenced ConfigMaps must be in the in-use set.
-	assert.True(t, inUse["xzk0-seat-config-e6120fae"])
-	assert.True(t, inUse["xzk0-seat-config-b870a608"])
-	assert.True(t, inUse["xzk0-seat-config-f3bca2cb"])
-	assert.True(t, inUse["xzk0-seat-config-d5eb6ebf"])
-	assert.Len(t, inUse, 4)
+	// All 4 referenced checksums must be in the set.
+	assert.True(t, checksums["e6120fae"])
+	assert.True(t, checksums["b870a608"])
+	assert.True(t, checksums["f3bca2cb"])
+	assert.True(t, checksums["d5eb6ebf"])
+	assert.Len(t, checksums, 4)
 }
 
 // ─── Interface compliance ──────────────────────────────────────────────────────

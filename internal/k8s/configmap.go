@@ -16,7 +16,15 @@ import (
 
 // ConfigMapLister lists ConfigMaps in a given namespace.
 type ConfigMapLister interface {
+	// ListConfigMaps returns ConfigMaps whose name starts with namePrefix.
+	// Deprecated: prefer ListAllConfigMaps + FilterConfigMapsByChecksums for
+	// multi-service namespaces where a single prefix is insufficient.
 	ListConfigMaps(ctx context.Context, namespace, namePrefix string) ([]corev1.ConfigMap, error)
+
+	// ListAllConfigMaps returns every ConfigMap in the namespace with no
+	// name-based filtering. Callers use FilterConfigMapsByChecksums to select
+	// only those referenced by Argo Rollout ReplicaSets.
+	ListAllConfigMaps(ctx context.Context, namespace string) ([]corev1.ConfigMap, error)
 }
 
 // ConfigMapDeleter deletes a single ConfigMap by name.
@@ -45,6 +53,9 @@ func NewKubeConfigMapClient(client kubernetes.Interface) *KubeConfigMapClient {
 // ListConfigMaps returns all ConfigMaps in the given namespace whose name starts
 // with namePrefix. It lists all ConfigMaps and filters client-side to avoid
 // relying on field selectors that may behave differently across cluster flavors.
+//
+// Deprecated: prefer ListAllConfigMaps + FilterConfigMapsByChecksums for
+// multi-service namespaces where a single prefix is insufficient.
 func (k *KubeConfigMapClient) ListConfigMaps(ctx context.Context, namespace, namePrefix string) ([]corev1.ConfigMap, error) {
 	list, err := k.client.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -58,6 +69,42 @@ func (k *KubeConfigMapClient) ListConfigMaps(ctx context.Context, namespace, nam
 		}
 	}
 	return matched, nil
+}
+
+// ListAllConfigMaps returns every ConfigMap in the namespace without any
+// name-based filtering. Use FilterConfigMapsByChecksums to narrow the result
+// to only those referenced by Argo Rollout ReplicaSets.
+func (k *KubeConfigMapClient) ListAllConfigMaps(ctx context.Context, namespace string) ([]corev1.ConfigMap, error) {
+	list, err := k.client.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list all configmaps in namespace %q: %w", namespace, err)
+	}
+	return list.Items, nil
+}
+
+// FilterConfigMapsByChecksums returns the subset of cms whose name contains at
+// least one of the checksums in the provided set. The match is a substring
+// check (strings.Contains) so it works regardless of the ConfigMap naming
+// convention used by each service (e.g. "xzk0-seat-config-e6120fae",
+// "other-svc-config-e6120fae", etc.).
+//
+// This is the Direction-B approach: instead of filtering by a fixed name prefix,
+// we let the checksum set (derived from Rollout ReplicaSet annotations) drive
+// which ConfigMaps the GC considers as candidates.
+func FilterConfigMapsByChecksums(cms []corev1.ConfigMap, checksums map[string]bool) []corev1.ConfigMap {
+	if len(checksums) == 0 {
+		return nil
+	}
+	var matched []corev1.ConfigMap
+	for _, cm := range cms {
+		for checksum := range checksums {
+			if strings.Contains(cm.Name, checksum) {
+				matched = append(matched, cm)
+				break
+			}
+		}
+	}
+	return matched
 }
 
 // DeleteConfigMap deletes the named ConfigMap from the given namespace.
